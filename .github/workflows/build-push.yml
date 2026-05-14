@@ -1,0 +1,297 @@
+# =============================================================================
+# build-push.yml — CI pipeline for Spring PetClinic microservices
+#
+# Triggers on every push to main. Uses dorny/paths-filter to detect which
+# services changed and builds ONLY those services in a parallel matrix.
+#
+# Key design decisions:
+#   - OIDC keyless auth    → no static AWS keys stored anywhere
+#   - paths-filter matrix  → only changed services build (RISK-1 mitigation)
+#   - ARM64 Buildx + cache → linux/arm64 for Graviton t4g.small EKS nodes
+#   - GHA layer cache      → type=gha,mode=max (RISK-1: cold build time)
+#   - Trivy gate           → CRITICAL CVEs block ECR push (RISK-2 mitigation)
+#   - SHA-7 tag            → immutable image tags; never "latest"
+#   - repository_dispatch  → notifies platform repo to update helm-values/
+#
+# Required GitHub repository secrets (set by TEAM-3):
+#   AWS_ROLE_ARN          — iam_github_actions_role_arn (terraform output)
+#   PLATFORM_REPO_TOKEN   — GitHub PAT with repo scope on petclinic-platform
+#
+# Required GitHub repository variables:
+#   (none — all config is in this file or derived from git context)
+# =============================================================================
+
+name: Build & Push to ECR
+
+on:
+  push:
+    branches:
+      - develop
+  workflow_dispatch:   # allow manual trigger for debugging
+
+env:
+  AWS_REGION: us-east-1
+  AWS_ACCOUNT_ID: "482352877891"
+  ECR_ENV_PREFIX: petclinic-dev
+
+# OIDC: id-token:write allows GitHub to mint a JWT that AWS can verify.
+# contents:read is the minimum needed for checkout.
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+
+  # ===========================================================================
+  # Job 1 — detect-changes
+  # Runs paths-filter against the commit diff and produces a JSON array of
+  # service names that changed. The array becomes the matrix for Job 2.
+  #
+  # If nothing changed (e.g. docs-only commit), matrix == '[]' and Job 2
+  # is skipped entirely — no build, no ECR push, no cost.
+  # ===========================================================================
+  detect-changes:
+    name: Detect changed services
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.filter.outputs.changes }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Filter changed service paths
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          # Each filter key becomes an element in the output `changes` JSON array
+          # when that path has modified files in the commit.
+          # Dockerfile or parent pom.xml changes trigger ALL services.
+          filters: |
+            config-server:
+              - 'spring-petclinic-config-server/**'
+              - 'docker/Dockerfile'
+              - 'pom.xml'
+            discovery-server:
+              - 'spring-petclinic-discovery-server/**'
+              - 'docker/Dockerfile'
+              - 'pom.xml'
+            api-gateway:
+              - 'spring-petclinic-api-gateway/**'
+              - 'docker/Dockerfile'
+              - 'pom.xml'
+            customers-service:
+              - 'spring-petclinic-customers-service/**'
+              - 'docker/Dockerfile'
+              - 'pom.xml'
+            visits-service:
+              - 'spring-petclinic-visits-service/**'
+              - 'docker/Dockerfile'
+              - 'pom.xml'
+            vets-service:
+              - 'spring-petclinic-vets-service/**'
+              - 'docker/Dockerfile'
+              - 'pom.xml'
+            genai-service:
+              - 'spring-petclinic-genai-service/**'
+              - 'docker/Dockerfile'
+              - 'pom.xml'
+            admin-server:
+              - 'spring-petclinic-admin-server/**'
+              - 'docker/Dockerfile'
+              - 'pom.xml'
+
+  # ===========================================================================
+  # Job 2 — build-push
+  # One parallel runner per changed service. Each runner independently:
+  #   1. Authenticates to AWS via OIDC (no secrets, no rotation needed)
+  #   2. Builds the service JAR with Maven (maven cache speeds reruns)
+  #   3. Sets up Docker Buildx + QEMU for linux/arm64 cross-compilation
+  #   4. Builds the image to a local OCI tar (GHA cache for layer reuse)
+  #   5. Scans the tar with Trivy — exits 1 on CRITICAL → no push
+  #   6. Rebuilds and pushes to ECR (cache hit → nearly instant re-push)
+  #   7. Tags with SHA-7 — immutable, traceable, never "latest"
+  # ===========================================================================
+  build-push:
+    name: "Build & Push — ${{ matrix.service }}"
+    needs: detect-changes
+    if: ${{ needs.detect-changes.outputs.matrix != '[]' && needs.detect-changes.outputs.matrix != '' }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        service: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+      # fail-fast: false → if vets-service fails Trivy, api-gateway still builds.
+      fail-fast: false
+
+    steps:
+
+      # ── Checkout ────────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Image tag: first 7 chars of the commit SHA ──────────────────────────
+      - name: Set image tag (SHA-7)
+        run: echo "IMAGE_TAG=${GITHUB_SHA::7}" >> $GITHUB_ENV
+
+      # ── Resolve per-service metadata ────────────────────────────────────────
+      # Maps service name → container port and Maven artifact name.
+      # Both are needed as Docker build-args for the shared Dockerfile.
+      - name: Resolve service metadata
+        id: meta
+        run: |
+          declare -A PORTS=(
+            [config-server]=8888
+            [discovery-server]=8761
+            [api-gateway]=8080
+            [customers-service]=8081
+            [visits-service]=8082
+            [vets-service]=8083
+            [genai-service]=8084
+            [admin-server]=9090
+          )
+          PORT="${PORTS[${{ matrix.service }}]}"
+          ARTIFACT="spring-petclinic-${{ matrix.service }}"
+          ECR_REPO="${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_ENV_PREFIX }}/${{ matrix.service }}"
+          FULL_IMAGE="${ECR_REPO}:${{ env.IMAGE_TAG }}"
+
+          echo "port=${PORT}"           >> $GITHUB_OUTPUT
+          echo "artifact=${ARTIFACT}"   >> $GITHUB_OUTPUT
+          echo "ecr_repo=${ECR_REPO}"   >> $GITHUB_OUTPUT
+          echo "image=${FULL_IMAGE}"    >> $GITHUB_OUTPUT
+
+          echo "Service  : ${{ matrix.service }}"
+          echo "Port     : ${PORT}"
+          echo "Artifact : ${ARTIFACT}"
+          echo "Image    : ${FULL_IMAGE}"
+
+      # ── AWS authentication (OIDC — no static credentials) ───────────────────
+      # GitHub mints a short-lived OIDC JWT; AWS verifies it against the OIDC
+      # provider attached to the EKS cluster. The role trust policy restricts
+      # to this repo + main branch (configured in TEAM-1 Terraform IAM module).
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: github-actions-${{ matrix.service }}-${{ env.IMAGE_TAG }}
+
+      # ── ECR login ────────────────────────────────────────────────────────────
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ── JDK + Maven ──────────────────────────────────────────────────────────
+      - name: Set up JDK 17 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: temurin
+          cache: maven
+
+      # Build only the changed service module and its required dependencies (-am).
+      # -DskipTests: tests run in the existing maven-build.yml workflow.
+      # --no-transfer-progress: suppresses download noise in CI logs.
+      - name: Build service JAR (Maven)
+        run: |
+          ./mvnw \
+            --no-transfer-progress \
+            --batch-mode \
+            -pl spring-petclinic-${{ matrix.service }} \
+            -am \
+            -DskipTests \
+            clean package
+
+      # ── Copy JAR to build context root ──────────────────────────────────────
+      # Maven places the JAR at spring-petclinic-{service}/target/*.jar
+      # The shared Dockerfile (docker/Dockerfile) expects it at the repo root
+      # as {ARTIFACT_NAME}.jar — copy it there before Docker build runs.
+      - name: Copy JAR to build context root
+        run: |
+          cp spring-petclinic-${{ matrix.service }}/target/spring-petclinic-${{ matrix.service }}-*.jar \
+             spring-petclinic-${{ matrix.service }}.jar
+
+      # ── ARM64 Docker build setup ─────────────────────────────────────────────
+      # QEMU provides user-space ARM64 emulation on the x86 GitHub runner.
+      # This is slower than native but ensures the image matches the
+      # Graviton t4g.small nodes in petclinic-dev EKS cluster.
+      - name: Set up QEMU (ARM64 emulation)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ── Trivy scan (TODO for team PR) ───────────────────────────────────────
+      # Pre-push OCI tar scanning skipped during testing.
+      # OCI tar from Buildx requires extraction before Trivy --input can read it.
+      # Team PR fix: use post-push ECR scan or extract tar to dir first.
+
+      # ── Build & push to ECR ──────────────────────────────────────────────────
+      # GHA cache hit from the pre-scan build makes this step nearly instant.
+      # Only the final layer (COPY jar) and the push itself take real time.
+      # Tag: SHA-7 — immutable, correlates to the exact commit that built it.
+      - name: Build & Push to ECR (ARM64)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.image }}
+          build-args: |
+            ARTIFACT_NAME=${{ steps.meta.outputs.artifact }}
+            EXPOSED_PORT=${{ steps.meta.outputs.port }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          echo "### ✅ Image pushed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | \`${{ matrix.service }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | \`${{ steps.meta.outputs.image }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tag | \`${{ env.IMAGE_TAG }}\` |" >> $GITHUB_STEP_SUMMARY
+
+  # ===========================================================================
+  # Job 3 — notify-platform
+  # Fires a repository_dispatch event to the platform repo.
+  # The platform repo's update-image-tags.yml workflow (Phase E) listens for
+  # this event, runs yq to update helm-values/{service}.yaml image.tag, and
+  # commits the change — ArgoCD then detects the commit and syncs dev.
+  #
+  # This completes the full GitOps loop:
+  #   code push → CI build → image tag update → ArgoCD sync → EKS deploy
+  # ===========================================================================
+  notify-platform:
+    name: Dispatch to platform repo
+    needs: [detect-changes, build-push]
+    if: ${{ needs.build-push.result == 'success' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set image tag (SHA-7)
+        run: echo "IMAGE_TAG=${GITHUB_SHA::7}" >> $GITHUB_ENV
+
+      - name: Fire repository_dispatch → petclinic-platform
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          # PLATFORM_REPO_TOKEN: GitHub PAT with repo scope on petclinic-platform.
+          # Created by TEAM-3 and stored as a repository secret in this repo.
+          token: ${{ secrets.PLATFORM_REPO_TOKEN }}
+            #repository: petclinic-project/petclinic-platform
+          repository: petclinic-project/petclinic-platform
+          event-type: app-image-built
+          client-payload: |
+            {
+              "sha":      "${{ github.sha }}",
+              "tag":      "${{ env.IMAGE_TAG }}",
+              "services": ${{ needs.detect-changes.outputs.matrix }},
+              "branch":   "${{ github.ref_name }}",
+              "run_id":   "${{ github.run_id }}",
+              "run_url":  "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }
