@@ -18,6 +18,7 @@ spec:
   # IMPORTANT: Replace with the actual GitHub org/repo URL.
   sourceRepos:
     - "https://github.com/petclinic-project/petclinic-platform.git"
+    - "https://github.com/petclinic-project/petclinic-microservices.git"
     - "https://aws.github.io/eks-charts"   # LB Controller Helm chart repo
 
   # Application CRDs may deploy only to these namespaces on the in-cluster API.
