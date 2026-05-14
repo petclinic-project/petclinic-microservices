@@ -1,5 +1,5 @@
 image:
-  repository: ""
+  repository: 482352877891.dkr.ecr.us-east-1.amazonaws.com/petclinic-dev/config-server
   tag: "latest"
 service:
   port: 8888
