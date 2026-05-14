@@ -1,6 +1,6 @@
 image:
   repository: 482352877891.dkr.ecr.us-east-1.amazonaws.com/petclinic-dev/visits-service
-  tag: "latest"
+  tag: f9c7e8e
 service:
   port: 8082
 configServer:
