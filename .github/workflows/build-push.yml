@@ -26,7 +26,7 @@ name: Build & Push to ECR
 on:
   push:
     branches:
-      - main
+      - develop
   workflow_dispatch:   # allow manual trigger for debugging
 
 env:
