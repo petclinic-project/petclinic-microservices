@@ -1,0 +1,15 @@
+replicaCount: 1
+
+resources:
+  requests:
+    cpu: "100m"
+    memory: "256Mi"
+  limits:
+    cpu: "500m"
+    memory: "512Mi"
+
+configServer:
+  url: "http://config-server:8888"
+
+eurekaServer:
+  url: "http://discovery-server:8761/eureka"

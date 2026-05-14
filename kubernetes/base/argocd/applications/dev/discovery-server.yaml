@@ -12,9 +12,9 @@ metadata:
 spec:
   project: petclinic
   source:
-    repoURL: https://github.com/petclinic-project/petclinic-platform.git
+    repoURL: https://github.com/petclinic-project/petclinic-microservices.git
     targetRevision: HEAD
-    path: petclinic-eks-deployment/helm/petclinic-service
+    path: helm/petclinic-service
     helm:
       releaseName: discovery-server
       valueFiles:

@@ -1,0 +1,28 @@
+replicaCount: 1
+
+image:
+  repository: ""
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+service:
+  type: ClusterIP
+  port: 8080
+
+resources:
+  requests:
+    cpu: "100m"
+    memory: "256Mi"
+  limits:
+    cpu: "500m"
+    memory: "512Mi"
+
+configServer:
+  enabled: true
+  url: "http://config-server:8888"
+
+eurekaServer:
+  enabled: true
+  url: "http://discovery-server:8761/eureka"
+
+env: []

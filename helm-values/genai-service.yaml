@@ -1,6 +1,9 @@
 image:
-  repository: 482352877891.dkr.ecr.us-east-1.amazonaws.com/petclinic-dev/genai-service
-  tag: latest
-  pullPolicy: IfNotPresent
-
-# tag is overwritten automatically by update-image-tags.yml on each CI build
+  repository: ""
+  tag: "latest"
+service:
+  port: 8084
+configServer:
+  enabled: true
+eurekaServer:
+  enabled: true
